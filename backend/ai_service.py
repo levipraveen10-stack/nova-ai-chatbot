@@ -1,7 +1,9 @@
 import os
+import time
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 
 
 load_dotenv()
@@ -14,9 +16,11 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+
+# Render environment variables override these defaults.
 PRIMARY_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.8-flash",
+    "gemini-3.6-flash",
 )
 
 FALLBACK_MODEL = os.getenv(
@@ -25,63 +29,204 @@ FALLBACK_MODEL = os.getenv(
 )
 
 
+# Number of attempts for each model.
+MAX_RETRIES = 3
+
+# First retry waits 1 second, second waits 2 seconds.
+BASE_RETRY_DELAY = 1
+
+
+def is_retryable_error(exc: Exception) -> bool:
+    """
+    Returns True for temporary Gemini/API errors that are worth retrying.
+    """
+
+    status_code = getattr(exc, "status_code", None)
+
+    if status_code is None:
+        status_code = getattr(exc, "code", None)
+
+    if status_code in (429, 500, 502, 503, 504):
+        return True
+
+    error_text = str(exc).lower()
+
+    retryable_messages = [
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "unavailable",
+        "high demand",
+        "resource exhausted",
+        "rate limit",
+        "temporarily unavailable",
+        "internal server error",
+        "timeout",
+        "timed out",
+    ]
+
+    return any(message in error_text for message in retryable_messages)
+
+
+def get_models():
+    """
+    Return primary and fallback models without duplicates.
+    """
+
+    models = []
+
+    for model in [PRIMARY_MODEL, FALLBACK_MODEL]:
+        if model and model not in models:
+            models.append(model)
+
+    return models
+
+
 def generate_ai_response(prompt: str) -> str:
+    """
+    Generate a normal text response.
+
+    Each model is retried up to 3 times for temporary errors.
+    If the primary model continues failing, the fallback model is used.
+    """
+
     last_error = None
 
-    for model_name in [PRIMARY_MODEL, FALLBACK_MODEL]:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
+    for model_name in get_models():
 
-            if response.text:
-                return response.text.strip()
+        for attempt in range(MAX_RETRIES):
 
-        except Exception as exc:
-            last_error = exc
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+
+                if response.text:
+                    return response.text.strip()
+
+                last_error = RuntimeError(
+                    f"{model_name} returned an empty response."
+                )
+
+                # Empty response is not normally fixed by retrying.
+                break
+
+            except Exception as exc:
+                last_error = exc
+
+                print(
+                    f"Gemini error on {model_name} "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES}): {exc}"
+                )
+
+                # Retry only temporary errors.
+                if (
+                    is_retryable_error(exc)
+                    and attempt < MAX_RETRIES - 1
+                ):
+                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+
+                    print(
+                        f"Retrying {model_name} in {delay} second(s)..."
+                    )
+
+                    time.sleep(delay)
+                    continue
+
+                # Move to fallback model.
+                break
 
     raise RuntimeError(
-        f"Gemini request failed on all configured models: {last_error}"
+        "Gemini request failed on all configured models: "
+        f"{last_error}"
     )
 
 
-def generate_response_with_image(prompt: str, image_data: bytes, mime_type: str) -> str:
-    """Generate response analyzing an image."""
-    from google.genai import types
-    import base64
+def generate_response_with_image(
+    prompt: str,
+    image_data: bytes,
+    mime_type: str,
+) -> str:
+    """
+    Generate a response by analysing an uploaded image.
+    """
+
     last_error = None
 
-    for model_name in [PRIMARY_MODEL, FALLBACK_MODEL]:
-        try:
-            # Convert image data to base64 string
-            image_base64 = base64.standard_b64encode(image_data).decode("utf-8")
-            
-            # Create Content with proper types
-            content = types.Content(
-                parts=[
-                    types.Part(text=prompt),
-                    types.Part(inline_data=types.Blob(mime_type=mime_type, data=image_base64))
-                ]
-            )
-            
-            response = client.models.generate_content(
-                model=model_name,
-                contents=content
-            )
+    content = types.Content(
+        parts=[
+            types.Part.from_text(text=prompt),
+            types.Part.from_bytes(
+                data=image_data,
+                mime_type=mime_type,
+            ),
+        ]
+    )
 
-            if response.text:
-                return response.text.strip()
+    for model_name in get_models():
 
-        except Exception as exc:
-            last_error = exc
+        for attempt in range(MAX_RETRIES):
+
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=content,
+                )
+
+                if response.text:
+                    return response.text.strip()
+
+                last_error = RuntimeError(
+                    f"{model_name} returned an empty image response."
+                )
+
+                break
+
+            except Exception as exc:
+                last_error = exc
+
+                print(
+                    f"Gemini image error on {model_name} "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES}): {exc}"
+                )
+
+                if (
+                    is_retryable_error(exc)
+                    and attempt < MAX_RETRIES - 1
+                ):
+                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+
+                    print(
+                        f"Retrying {model_name} in {delay} second(s)..."
+                    )
+
+                    time.sleep(delay)
+                    continue
+
+                break
 
     raise RuntimeError(
-        f"Gemini image analysis failed: {last_error}"
+        "Gemini image analysis failed on all configured models: "
+        f"{last_error}"
     )
 
 
-def generate_response_with_text_file(prompt: str, file_text: str) -> str:
-    """Generate response with document context."""
-    combined_prompt = f"{prompt}\n\n---DOCUMENT---\n{file_text}\n---END DOCUMENT---"
+def generate_response_with_text_file(
+    prompt: str,
+    file_text: str,
+) -> str:
+    """
+    Generate a response using extracted text from an uploaded document.
+    """
+
+    combined_prompt = (
+        f"{prompt}\n\n"
+        "---DOCUMENT---\n"
+        f"{file_text}\n"
+        "---END DOCUMENT---"
+    )
+
     return generate_ai_response(combined_prompt)
