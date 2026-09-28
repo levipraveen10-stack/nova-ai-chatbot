@@ -42,7 +42,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://nova-ai-chatbot-xi.vercel.app",
     ],
+    allow_origin_regex=r"https://nova-ai-chatbot(?:-[a-z0-9]+)*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
